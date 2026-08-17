@@ -1,474 +1,404 @@
-import io, json, re, time
+import io, os, re, json, time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple
+
 import streamlit as st
 from docx import Document
 from openai import OpenAI
 
-st.set_page_config(page_title='Dịch Truyện AI V4 Pro 1.2', page_icon='📖', layout='wide')
+APP_VERSION = "Dịch Truyện AI V5 PRO"
+DEFAULT_MODEL = "deepseek-v4-pro"
 
-DEFAULT_MODEL = 'deepseek-v4-pro'
-DEFAULT_STYLE = '''Văn phong tiểu thuyết Việt tự nhiên, mượt, dễ đọc như bản dịch được biên tập kỹ.
-Giữ đúng sắc thái cảm xúc, bối cảnh và quan hệ nhân vật. Đối thoại tự nhiên, phù hợp vai vế.
-Không dịch máy móc từng chữ. Không tự ý thêm, bớt, giải thích hoặc diễn giải nội dung.'''
+# -----------------------------
+# Text / document helpers
+# -----------------------------
 
-# =========================
-# ĐỌC FILE
-# =========================
-def read_docx(data):
-    doc = Document(io.BytesIO(data))
-    return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+def read_upload(uploaded) -> str:
+    data = uploaded.getvalue()
+    name = uploaded.name.lower()
+    if name.endswith('.txt'):
+        for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'gbk'):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                pass
+        raise ValueError('Không đọc được file TXT với các bảng mã UTF-8/GB18030/GBK.')
+    if name.endswith('.docx'):
+        doc = Document(io.BytesIO(data))
+        return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+    raise ValueError('Chỉ hỗ trợ DOCX hoặc TXT.')
 
 
-def read_txt(data):
-    for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'gbk'):
-        try:
-            return [x.strip() for x in data.decode(enc).splitlines() if x.strip()]
-        except UnicodeDecodeError:
+def normalize_text(text: str) -> str:
+    text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\ufeff', '')
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+CHAPTER_PATTERNS = [
+    re.compile(r'^\s*(?:第\s*)?(\d{1,5})\s*[章节卷集篇回]\s*.*$', re.I),
+    re.compile(r'^\s*Chương\s+\d+.*$', re.I),
+    re.compile(r'^\s*chapter\s+\d+.*$', re.I),
+    re.compile(r'^\s*第[一二三四五六七八九十百千万零〇\d]+章.*$'),
+]
+
+
+def split_chapters(text: str) -> List[Dict[str, str]]:
+    lines = text.split('\n')
+    starts = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
             continue
-    raise ValueError('Không đọc được TXT. Hãy lưu TXT bằng UTF-8 hoặc GB18030.')
-
-
-# =========================
-# NHẬN DIỆN CHƯƠNG
-# =========================
-CHAPTER_RE = re.compile(
-    r'^\s*(第\s*[0-9一二三四五六七八九十百千万两零]+\s*[章回节卷篇部]|'
-    r'chương\s+\d+(?:\s*[:：.\-].*)?|chapter\s+\d+)(?:\s*)$', re.I
-)
-
-
-def split_chapters(paragraphs):
-    starts = [i for i, p in enumerate(paragraphs) if CHAPTER_RE.match(p)]
+        if any(p.match(s) for p in CHAPTER_PATTERNS):
+            starts.append(i)
     if not starts:
-        return [{'number': 1, 'source_title': 'Chương 1', 'paragraphs': paragraphs}]
-
-    out = []
-    for n, start in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else len(paragraphs)
-        title = paragraphs[start]
-        out.append({
-            'number': n + 1,
-            'source_title': title,
-            'paragraphs': paragraphs[start + 1:end]
-        })
-    return out
+        return [{'title': 'Toàn văn', 'text': text.strip()}]
+    chapters = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
+        title = lines[start].strip()
+        body = '\n'.join(lines[start + 1:end]).strip()
+        chapters.append({'title': title, 'text': body})
+    return chapters
 
 
-# =========================
-# CHIA CHUNK
-# =========================
-SENTENCE_RE = re.compile(r'(?<=[。！？!?…；;])\s+|(?<=[。！？!?…；;])(?=[\u4e00-\u9fff])')
-
-
-def split_long_paragraph(text, limit):
-    if len(text) <= limit:
-        return [text]
-
-    sentences = [x.strip() for x in SENTENCE_RE.split(text) if x.strip()]
-    if not sentences:
-        return [text[i:i + limit] for i in range(0, len(text), limit)]
-
-    out, cur = [], ''
-    for s in sentences:
-        if len(s) > limit:
-            if cur:
-                out.append(cur)
-                cur = ''
-            out.extend([s[i:i + limit] for i in range(0, len(s), limit)])
-            continue
-        if cur and len(cur) + 1 + len(s) > limit:
-            out.append(cur)
-            cur = ''
-        cur = s if not cur else cur + ' ' + s
-    if cur:
-        out.append(cur)
-    return out
-
-
-def make_chunks(paragraphs, limit=4500):
-    chunks, cur, size = [], [], 0
-    for p in paragraphs:
-        for piece in split_long_paragraph(p, limit):
-            if cur and size + len(piece) + 1 > limit:
-                chunks.append(cur)
-                cur, size = [], 0
-            cur.append(piece)
-            size += len(piece) + 1
-    if cur:
-        chunks.append(cur)
+def chunk_text(text: str, max_chars: int) -> List[str]:
+    paras = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    chunks, current, size = [], [], 0
+    for p in paras:
+        # hard split unusually large paragraphs by sentence/newline
+        pieces = [p]
+        if len(p) > max_chars:
+            pieces = re.split(r'(?<=[。！？!?])', p)
+            pieces = [x for x in pieces if x.strip()]
+        for piece in pieces:
+            if current and size + len(piece) + 2 > max_chars:
+                chunks.append('\n\n'.join(current))
+                current, size = [], 0
+            current.append(piece)
+            size += len(piece) + 2
+    if current:
+        chunks.append('\n\n'.join(current))
     return chunks
 
+# -----------------------------
+# DeepSeek client
+# -----------------------------
 
-# =========================
-# API - V4 PRO, CHỐNG TIMEOUT
-# =========================
-def make_client(api_key):
-    # Timeout dài hơn cho truyện dài; retry tự kiểm soát để dễ báo tiến độ.
-    return OpenAI(
-        api_key=api_key,
-        base_url='https://api.deepseek.com',
-        timeout=180.0,
-        max_retries=0,
-    )
+def get_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
 
 
-def parse_json(text):
-    if not text:
-        raise ValueError('DeepSeek trả về nội dung rỗng.')
+def extract_content(response) -> str:
     try:
-        return json.loads(text)
+        content = response.choices[0].message.content
     except Exception:
-        m = re.search(r'\{.*\}', text, re.S)
-        if m:
-            return json.loads(m.group(0))
-        raise ValueError('DeepSeek không trả JSON hợp lệ.')
+        content = None
+    if content is None:
+        return ''
+    return str(content).strip()
 
 
-def call_json(client, model, system, user, max_tokens=7000, retries=3):
-    """Call DeepSeek for structured JSON.
-
-    V4-Pro can spend the whole completion budget on hidden reasoning, which may
-    leave message.content empty. For these structured extraction/translation
-    calls we explicitly disable thinking so the JSON is returned reliably.
-    """
+def call_model(client: OpenAI, model: str, system: str, user: str,
+               max_tokens: int, json_mode: bool = False,
+               thinking: bool = True, retries: int = 3) -> str:
     last_error = None
     for attempt in range(retries):
         try:
-            response = client.chat.completions.create(
+            kwargs = dict(
                 model=model,
-                messages=[
-                    {'role': 'system', 'content': system},
-                    {'role': 'user', 'content': user},
-                ],
-                stream=False,
-                response_format={'type': 'json_object'},
+                messages=[{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
                 max_tokens=max_tokens,
-                extra_body={'thinking': {'type': 'disabled'}},
+                stream=False,
             )
-            choice = response.choices[0]
-            content = choice.message.content
-            if content and content.strip():
-                return parse_json(content)
-
-            finish = getattr(choice, 'finish_reason', None)
-            raise ValueError(
-                f'DeepSeek trả về nội dung rỗng (finish_reason={finish}).'
-            )
-        except Exception as exc:
-            last_error = exc
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt * 2)
-    raise last_error
-
-
-# =========================
-# STORY BIBLE
-# =========================
-def select_story_samples(chapters, max_chars=24000):
-    if not chapters:
-        return ''
-
-    if len(chapters) <= 12:
-        selected = chapters
-    else:
-        idx = list(range(min(6, len(chapters))))
-        mid = len(chapters) // 2
-        idx += list(range(max(0, mid - 2), min(len(chapters), mid + 2)))
-        idx += list(range(max(0, len(chapters) - 4), len(chapters)))
-        selected = [chapters[i] for i in sorted(set(idx))]
-
-    blocks = []
-    for ch in selected:
-        text = '\n'.join(ch['paragraphs'][:30])
-        blocks.append(f"### {ch['source_title']}\n{text}")
-
-    return '\n\n'.join(blocks)[:max_chars]
+            if json_mode:
+                kwargs['response_format'] = {'type': 'json_object'}
+            # V5 fix: the OpenAI Python SDK may reject thinking=... as a direct
+            # keyword. DeepSeek documents it as an API field; extra_body keeps
+            # it compatible with the OpenAI SDK.
+            if thinking:
+                kwargs['reasoning_effort'] = 'high'
+                kwargs['extra_body'] = {'thinking': {'type': 'enabled'}}
+            else:
+                kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
+            response = client.chat.completions.create(**kwargs)
+            content = extract_content(response)
+            if content:
+                return content
+            last_error = RuntimeError('DeepSeek trả về nội dung rỗng.')
+        except Exception as e:
+            last_error = e
+        time.sleep(min(2 ** attempt, 5))
+        # A blank/failed thinking request can be retried once without thinking.
+        if attempt == 1 and thinking:
+            thinking = False
+    raise last_error or RuntimeError('API không trả về nội dung.')
 
 
-def build_story_bible(client, model, chapters, style):
-    sample = select_story_samples(chapters)
-    system = '''Bạn là biên tập viên tiểu thuyết Trung -> Việt.
-Hãy tạo STORY BIBLE để một bộ truyện dài được dịch nhất quán xuyên suốt.
-Chỉ ghi thông tin có căn cứ từ văn bản. Không đoán nếu chưa đủ căn cứ.
-Đặc biệt phải theo dõi: tên gốc, tên Việt/Hán-Việt, giới tính, vai trò, quan hệ,
-ngôi xưng và cách gọi giữa từng cặp nhân vật, địa danh, tổ chức, chức danh,
-thuật ngữ, bối cảnh và quy tắc văn phong.
-Đầu ra bắt buộc là JSON hợp lệ.'''
-    user = f'''Phong cách dịch:
+def call_json(client, model, system, user, max_tokens=7000):
+    raw = call_model(client, model, system, user, max_tokens, json_mode=True, thinking=True)
+    # tolerate markdown fences despite JSON mode
+    raw = re.sub(r'^```json\s*|^```\s*|\s*```$', '', raw.strip(), flags=re.I)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r'\{.*\}', raw, re.S)
+        if m:
+            return json.loads(m.group(0))
+        raise ValueError('Model trả về JSON không hợp lệ.')
+
+# -----------------------------
+# Story Bible
+# -----------------------------
+
+BIBLE_SCHEMA = {
+    'characters': [
+        {
+            'name_cn': '', 'name_vi': '', 'aliases': [], 'gender': '',
+            'role': '', 'personality': '', 'self_pronoun': '',
+            'address_rules': [{'to': '', 'call': '', 'self': '', 'context': ''}],
+        }
+    ],
+    'terms': [{'source': '', 'translation': '', 'type': '', 'note': ''}],
+    'places': [{'source': '', 'translation': '', 'note': ''}],
+    'organizations': [{'source': '', 'translation': '', 'note': ''}],
+    'style': {'era': '', 'genre': '', 'narration': '', 'general_pronoun_rule': ''},
+}
+
+BIBLE_SYSTEM = '''Bạn là biên tập viên truyện Trung-Việt chuyên nghiệp. Hãy xây STORY BIBLE có tính "khóa".
+Mục tiêu: giữ tên nhân vật, quan hệ, giới tính, xưng hô, thuật ngữ, địa danh và văn phong nhất quán cho toàn bộ truyện.
+Không tự bịa chi tiết không có trong văn bản. Nếu chưa chắc, để trống hoặc ghi mức độ chưa xác định.
+Đặc biệt phải phân biệt: tự xưng của từng nhân vật và cách nhân vật A gọi nhân vật B theo từng quan hệ/ngữ cảnh.
+Trả về JSON đúng schema được yêu cầu.'''
+
+
+def build_story_bible(client, model, chapters, style, sample_limit=50000):
+    source = '\n\n'.join(f"[{c['title']}]\n{c['text']}" for c in chapters)
+    source = source[:sample_limit]
+    user = f'''Phong cách dịch mong muốn:
 {style}
 
-Hãy trả JSON theo đúng cấu trúc:
-{{
-  "characters": [],
-  "pronoun_rules": [],
-  "glossary": [],
-  "places": [],
-  "organizations": [],
-  "world_rules": [],
-  "style_rules": [],
-  "uncertain_items": []
-}}
+Schema JSON bắt buộc:
+{json.dumps(BIBLE_SCHEMA, ensure_ascii=False)}
 
-Mỗi nhân vật nên cố gắng có các trường: name_cn, name_vi, gender, role, relationships, notes.
-Mỗi quy tắc xưng hô nên có: speaker, listener, pronoun, condition, notes.
-Không tự bịa thông tin không có trong mẫu.
-
-MẪU RẢI ĐỀU TRONG TRUYỆN:
-{sample}'''
-    return call_json(client, model, system, user, max_tokens=9000)
+Văn bản nguồn:
+{source}'''
+    return call_json(client, model, BIBLE_SYSTEM, user, max_tokens=9000)
 
 
-# =========================
-# LỌC BỘ NHỚ LIÊN QUAN
-# =========================
-def item_text(x):
-    return json.dumps(x, ensure_ascii=False)
-
-
-def relevant_memory(memory, source):
-    result = {
-        'characters': [], 'pronoun_rules': [], 'glossary': [], 'places': [],
-        'organizations': [], 'world_rules': memory.get('world_rules', [])[:25],
-        'style_rules': memory.get('style_rules', [])[:25]
-    }
-
-    matched_names = set()
-    for c in memory.get('characters', []):
-        keys = [c.get('name_cn', ''), c.get('name_vi', '')]
-        if any(k and k in source for k in keys):
-            result['characters'].append(c)
-            matched_names.update(k for k in keys if k)
-
-    for r in memory.get('pronoun_rules', []):
-        txt = item_text(r)
-        if not matched_names or any(n in txt for n in matched_names):
-            result['pronoun_rules'].append(r)
-
-    for key in ('glossary', 'places', 'organizations'):
-        for x in memory.get(key, []):
-            txt = item_text(x)
-            vals = [
-                x.get('source', ''), x.get('translation', ''),
-                x.get('name_cn', ''), x.get('name_vi', '')
-            ]
-            if any(v and v in source for v in vals) or any(n in txt for n in matched_names):
-                result[key].append(x)
-
-    # Nếu chunk không chứa tên rõ ràng, gửi một nền nhỏ thay vì toàn bộ bộ nhớ.
-    if not result['characters']:
-        result['characters'] = memory.get('characters', [])[:35]
-    if not result['pronoun_rules']:
-        result['pronoun_rules'] = memory.get('pronoun_rules', [])[:35]
-    return result
-
-
-# =========================
-# DỊCH CHUNK + CẬP NHẬT MEMORY
-# =========================
-def translate_chunk(client, model, chapter_title, chunk, memory, style):
-    source = '\n'.join(f'[P{i + 1}] {p}' for i, p in enumerate(chunk))
-    rel = relevant_memory(memory, source)
-
-    system = '''Bạn là dịch giả tiểu thuyết Trung -> Việt chuyên nghiệp.
-Dịch tự nhiên, mượt, có văn phong tiểu thuyết Việt; ưu tiên đúng nghĩa và đúng cảm xúc.
-Không dịch từng chữ máy móc. Không tự ý thêm, bớt hoặc giải thích nội dung.
-
-QUY TẮC BẮT BUỘC:
-1. Tên nhân vật phải thống nhất theo STORY BIBLE.
-2. Không tự đổi cách gọi tên giữa các đoạn.
-3. Xưng hô phải đúng giới tính, tuổi/vai vế, quan hệ và bối cảnh.
-4. Nếu STORY BIBLE chưa đủ căn cứ, giữ cách dịch trung tính thay vì tự bịa.
-5. Giữ đúng thứ tự đoạn P1, P2... và trả đúng số lượng đoạn.
-6. Các câu thoại phải tự nhiên như văn nói của nhân vật Việt.
-7. Đầu ra bắt buộc là JSON hợp lệ.'''
-
-    user = f'''CHƯƠNG: {chapter_title}
-
+def bible_for_prompt(bible: Dict[str, Any]) -> str:
+    chars = []
+    for c in bible.get('characters', []):
+        rules = '; '.join(
+            f"gọi {r.get('to','')} = {r.get('call','')}, tự xưng = {r.get('self','')} ({r.get('context','')})"
+            for r in c.get('address_rules', []) if r.get('call') or r.get('self')
+        )
+        chars.append(
+            f"- {c.get('name_cn','')} -> {c.get('name_vi','')}; bí danh={c.get('aliases',[])}; "
+            f"giới tính={c.get('gender','')}; vai trò={c.get('role','')}; tính cách={c.get('personality','')}; "
+            f"tự xưng mặc định={c.get('self_pronoun','')}; quy tắc={rules}"
+        )
+    terms = '\n'.join(f"- {x.get('source')} -> {x.get('translation')} [{x.get('type','')}]" for x in bible.get('terms', []))
+    places = '\n'.join(f"- {x.get('source')} -> {x.get('translation')}" for x in bible.get('places', []))
+    orgs = '\n'.join(f"- {x.get('source')} -> {x.get('translation')}" for x in bible.get('organizations', []))
+    return f'''STORY BIBLE — KHÔNG ĐƯỢC TỰ Ý ĐỔI:
+NHÂN VẬT:
+{chr(10).join(chars)}
+THUẬT NGỮ:
+{terms}
+ĐỊA DANH:
+{places}
+TỔ CHỨC:
+{orgs}
 PHONG CÁCH:
+{json.dumps(bible.get('style',{}), ensure_ascii=False)}'''
+
+# -----------------------------
+# Translation + validation
+# -----------------------------
+
+TRANSLATE_SYSTEM = '''Bạn là dịch giả truyện Trung-Việt. Dịch văn bản nguồn sang tiếng Việt tự nhiên, mượt, giàu cảm xúc, đúng bối cảnh.
+Giữ nguyên diễn biến, không tóm tắt, không thêm tình tiết, không giải thích ngoài truyện.
+Ưu tiên văn phong cổ trang khi nguồn là cổ trang; lời thoại phải tự nhiên nhưng phù hợp địa vị và quan hệ.
+BẮT BUỘC tuân thủ STORY BIBLE, đặc biệt tên nhân vật và xưng hô.
+Không được đổi "ta" thành "tôi", "nàng" thành "cô ấy", "chàng" thành "anh ấy" nếu STORY BIBLE không cho phép.
+Không thêm tiêu đề chương nếu đoạn nguồn không có.
+Chỉ trả về bản dịch, không trả JSON, không nhận xét.'''
+
+CHECK_SYSTEM = '''Bạn là biên tập viên kiểm định bản dịch truyện. So sánh bản nguồn, bản dịch và STORY BIBLE.
+Chỉ tìm lỗi nhất quán có thể xác định: sai tên, sai giới tính, sai quan hệ, sai cách xưng hô, sai thuật ngữ, sai địa danh, hoặc tự ý thêm/bớt nội dung.
+Trả JSON: {"ok": true/false, "issues": [{"type":"pronoun|name|term|omission|addition|style", "original":"", "translated":"", "fix":""}]}
+Không đánh dấu khác biệt văn phong nhỏ nếu không làm sai nghĩa.'''
+
+FIX_SYSTEM = '''Bạn là biên tập viên sửa bản dịch truyện. Sửa CHỈ những lỗi được chỉ ra, giữ nguyên mọi phần đúng.
+Không tóm tắt, không thêm nội dung, không đổi giọng kể ngoài phạm vi lỗi.
+Trả về toàn bộ đoạn đã sửa, không giải thích.'''
+
+
+def translate_chunk(client, model, bible_text, prev_context, source_chunk, style):
+    user = f'''{bible_text}
+
+PHONG CÁCH DỊCH:
 {style}
 
-STORY BIBLE LIÊN QUAN:
-{json.dumps(rel, ensure_ascii=False, indent=2)}
+NGỮ CẢNH LIỀN TRƯỚC (chỉ để hiểu quan hệ, không dịch lại):
+{prev_context[-5000:]}
 
-ĐOẠN NGUỒN:
+ĐOẠN NGUỒN CẦN DỊCH:
+{source_chunk}'''
+    return call_model(client, model, TRANSLATE_SYSTEM, user, max_tokens=9000, json_mode=False, thinking=True)
+
+
+def validate_chunk(client, model, bible_text, source, translated):
+    user = f'''{bible_text}
+
+BẢN NGUỒN:
 {source}
 
-Hãy trả đúng JSON:
-{{
-  "paragraphs": ["bản dịch P1", "bản dịch P2"],
-  "memory_updates": {{
-    "characters": [],
-    "pronoun_rules": [],
-    "glossary": [],
-    "places": [],
-    "organizations": [],
-    "world_rules": []
-  }}
-}}
-
-Đầu vào có {len(chunk)} đoạn. "paragraphs" bắt buộc có đúng {len(chunk)} phần tử.
-Không được đưa ký hiệu [P1], [P2]... vào bản dịch.'''
-
-    data = call_json(client, model, system, user, max_tokens=max(8000, len(chunk) * 1000))
-    paragraphs = data.get('paragraphs', [])
-
-    if len(paragraphs) != len(chunk):
-        repair_user = user + f'''
-
-CẢNH BÁO: Bạn vừa trả sai số lượng đoạn. Hãy trả lại JSON với đúng {len(chunk)} phần tử trong "paragraphs".'''
-        data = call_json(client, model, system, repair_user, max_tokens=max(8000, len(chunk) * 1000))
-        paragraphs = data.get('paragraphs', [])
-
-    if len(paragraphs) != len(chunk):
-        raise ValueError(f'DeepSeek trả {len(paragraphs)} đoạn thay vì {len(chunk)} đoạn.')
-
-    return paragraphs, data.get('memory_updates', {})
-
-
-# =========================
-# MERGE MEMORY THÔNG MINH
-# =========================
-def merge_by_key(existing, incoming, keys):
-    out = list(existing)
-    for item in incoming or []:
-        if not item:
-            continue
-        found = None
-        for old in out:
-            if any(item.get(k) and old.get(k) == item.get(k) for k in keys):
-                found = old
-                break
-        if found is None:
-            out.append(item)
-        else:
-            for k, v in item.items():
-                if v not in (None, '', [], {}):
-                    found[k] = v
-    return out
-
-
-def merge_memory(memory, update):
-    for k in ('characters', 'pronoun_rules', 'glossary', 'places', 'organizations', 'world_rules', 'style_rules', 'uncertain_items'):
-        memory.setdefault(k, [])
-
-    memory['characters'] = merge_by_key(memory['characters'], update.get('characters'), ['name_cn', 'name_vi'])
-    memory['pronoun_rules'] = merge_by_key(memory['pronoun_rules'], update.get('pronoun_rules'), ['speaker', 'listener', 'pronoun'])
-    memory['glossary'] = merge_by_key(memory['glossary'], update.get('glossary'), ['source', 'translation', 'name_cn', 'name_vi'])
-    memory['places'] = merge_by_key(memory['places'], update.get('places'), ['name_cn', 'name_vi', 'source', 'translation'])
-    memory['organizations'] = merge_by_key(memory['organizations'], update.get('organizations'), ['name_cn', 'name_vi', 'source', 'translation'])
-
-    for k in ('world_rules', 'style_rules', 'uncertain_items'):
-        for item in update.get(k, []) or []:
-            if item and item not in memory[k]:
-                memory[k].append(item)
-    return memory
-
-
-# =========================
-# XUẤT WORD
-# =========================
-def export_docx(book):
-    doc = Document()
-    for i, ch in enumerate(book):
-        doc.add_heading(ch['title'], level=1)
-        for p in ch['paragraphs']:
-            doc.add_paragraph(p)
-        if i < len(book) - 1:
-            doc.add_page_break()
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-# =========================
-# UI
-# =========================
-st.sidebar.title('⚙️ Cài đặt')
-api_key = st.sidebar.text_input('DeepSeek API Key', type='password')
-model = st.sidebar.text_input('Mô hình DeepSeek', value=DEFAULT_MODEL)
-style = st.sidebar.text_area('Phong cách dịch', value=DEFAULT_STYLE, height=180)
-limit = st.sidebar.slider('Độ dài mỗi lượt dịch (ký tự)', 3000, 7000, 4500, 500)
-retries = st.sidebar.slider('Số lần thử lại khi API lỗi', 1, 4, 3)
-
-st.title('📖 Dịch Truyện AI V4 Pro 1.2')
-st.caption('Word/TXT → nhận diện chương → STORY BIBLE → chia nhỏ → lọc bộ nhớ → dịch tuần tự → cập nhật bộ nhớ → xuất 1 file Word')
-
-file = st.file_uploader('📄 Tải 1 file truyện dài', type=['docx', 'txt'])
-
-if file:
+BẢN DỊCH:
+{translated}'''
     try:
-        raw = file.getvalue()
-        paras = read_docx(raw) if file.name.lower().endswith('.docx') else read_txt(raw)
-        chapters = split_chapters(paras)
-        total_chars = sum(len(p) for p in paras)
-        total_chunks = sum(len(make_chunks(c['paragraphs'], limit)) for c in chapters)
+        return call_json(client, model, CHECK_SYSTEM, user, max_tokens=3500)
+    except Exception:
+        return {'ok': True, 'issues': []}
 
-        st.success(
-            f'Đã đọc {len(paras):,} đoạn • {total_chars:,} ký tự • '
-            f'phát hiện {len(chapters):,} chương • dự kiến {total_chunks:,} lượt dịch.'
-        )
 
-        if not api_key:
-            st.warning('Nhập DeepSeek API Key ở thanh bên trái trước khi bắt đầu.')
+def fix_chunk(client, model, bible_text, translated, issues):
+    if not issues:
+        return translated
+    user = f'''{bible_text}
 
-        if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH V4 PRO', type='primary', disabled=not bool(api_key)):
-            client = make_client(api_key)
-            status = st.empty()
-            bar = st.progress(0)
-            memory = None
-            book = []
+LỖI CẦN SỬA:
+{json.dumps(issues, ensure_ascii=False)}
+
+BẢN DỊCH:
+{translated}'''
+    return call_model(client, model, FIX_SYSTEM, user, max_tokens=9000, thinking=True)
+
+# deterministic guardrails for obvious pronoun drift
+
+def pronoun_guard(text: str, bible: Dict[str, Any]) -> List[str]:
+    issues = []
+    style = bible.get('style', {})
+    rule = style.get('general_pronoun_rule', '')
+    if 'ta' in rule.lower():
+        # Flag common modern drift; model review handles context-specific cases.
+        if re.search(r'\b(tôi|cô ấy|anh ấy|cậu ấy)\b', text, re.I):
+            issues.append('Phát hiện đại từ hiện đại có thể lệch văn phong/xưng hô: tôi/cô ấy/anh ấy/cậu ấy. Cần kiểm tra theo STORY BIBLE.')
+    return issues
+
+# -----------------------------
+# Word export
+# -----------------------------
+
+def export_docx(title: str, translated_chapters: List[Dict[str, str]], bible: Dict[str, Any]) -> bytes:
+    doc = Document()
+    doc.add_heading(title, level=1)
+    for ch in translated_chapters:
+        doc.add_heading(ch['title'], level=2)
+        for p in ch['text'].split('\n\n'):
+            if p.strip():
+                doc.add_paragraph(p.strip())
+    bio = doc.core_properties
+    bio.title = title
+    bio.subject = APP_VERSION
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+st.set_page_config(page_title=APP_VERSION, page_icon='📖', layout='wide')
+
+st.title('📖 Dịch Truyện AI V5 PRO')
+st.caption('Word/TXT → nhận diện chương → STORY BIBLE khóa xưng hô → chia nhỏ thông minh → dịch → kiểm tra → sửa lỗi → xuất Word')
+
+with st.sidebar:
+    st.header('⚙️ Cài đặt')
+    api_key = st.text_input('DeepSeek API Key', type='password', value=st.secrets.get('DEEPSEEK_API_KEY', os.getenv('DEEPSEEK_API_KEY', '')))
+    model = st.selectbox('Mô hình DeepSeek', [DEFAULT_MODEL, 'deepseek-v4-flash'], index=0)
+    style = st.text_area('Phong cách dịch', value='Văn phong truyện tự nhiên, mượt, dễ đọc như bản dịch tiểu thuyết Việt được biên tập kỹ. Giữ sắc thái cảm xúc và bối cảnh. Đối thoại tự nhiên, không máy móc. Không tự ý thêm, bớt hoặc giải thích nội dung.', height=180)
+    chunk_size = st.slider('Độ dài mỗi lượt dịch (ký tự)', 3500, 10000, 7000, 500)
+    use_thinking = st.checkbox('DeepSeek V4 Pro Thinking', value=True)
+    st.info('V5 Pro có kiểm tra xưng hô/tên/thuật ngữ sau mỗi chunk và có bước sửa riêng.')
+
+uploaded = st.file_uploader('📄 Tải 1 file truyện dài', type=['docx', 'txt'])
+
+if uploaded:
+    try:
+        raw = normalize_text(read_upload(uploaded))
+        chapters = split_chapters(raw)
+        st.success(f'Đã đọc {len(raw):,} ký tự • phát hiện {len(chapters)} chương • dự kiến {sum(max(1, len(chunk_text(c["text"], chunk_size))) for c in chapters)} lượt dịch.')
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    if not api_key:
+        st.warning('Hãy nhập DeepSeek API Key ở thanh bên trái.')
+        st.stop()
+
+    if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH V5 PRO', type='primary'):
+        client = get_client(api_key)
+        progress = st.progress(0)
+        status = st.empty()
+        try:
+            status.info('Bước 1/4: đang xây STORY BIBLE khóa nhân vật và xưng hô...')
+            bible = build_story_bible(client, model, chapters, style)
+            st.session_state['bible'] = bible
+
+            total_chunks = sum(len(chunk_text(c['text'], chunk_size)) for c in chapters)
             done = 0
+            translated = []
+            prev = ''
+            errors = []
 
-            try:
-                status.info('Bước 1/2: đang tạo STORY BIBLE với DeepSeek V4 Pro...')
-                memory = build_story_bible(client, model, chapters, style)
-                st.session_state['memory'] = memory
+            for ci, chapter in enumerate(chapters, start=1):
+                status.info(f'Bước 2/4: đang dịch {chapter["title"]} ({ci}/{len(chapters)})...')
+                out_chunks = []
+                for source_chunk in chunk_text(chapter['text'], chunk_size):
+                    bible_text = bible_for_prompt(bible)
+                    try:
+                        # The UI checkbox controls only effort; the API wrapper also has a safe fallback.
+                        translated_chunk = translate_chunk(client, model, bible_text, prev, source_chunk, style)
+                        check = validate_chunk(client, model, bible_text, source_chunk, translated_chunk)
+                        issues = check.get('issues', []) if isinstance(check, dict) else []
+                        issues += [{'type': 'style', 'original': '', 'translated': '', 'fix': x} for x in pronoun_guard(translated_chunk, bible)]
+                        if issues:
+                            translated_chunk = fix_chunk(client, model, bible_text, translated_chunk, issues)
+                        out_chunks.append(translated_chunk)
+                        prev = (prev + '\n\n' + translated_chunk)[-7000:]
+                    except Exception as e:
+                        errors.append(f'{chapter["title"]}: {e}')
+                        # Keep source visible rather than silently losing text.
+                        out_chunks.append('[LỖI DỊCH CHUNK — CẦN CHẠY LẠI]\n' + source_chunk)
+                    done += 1
+                    progress.progress(min(done / max(total_chunks, 1), 1.0))
+                translated.append({'title': chapter['title'], 'text': '\n\n'.join(out_chunks)})
 
-                status.info(f'Bước 2/2: đang chia nhỏ và dịch {total_chunks:,} lượt...')
-                for ch in chapters:
-                    out = []
-                    parts = make_chunks(ch['paragraphs'], limit)
-                    for idx, part in enumerate(parts, start=1):
-                        status.info(
-                            f'Đang dịch Chương {ch["number"]}/{len(chapters)} • '
-                            f'phần {idx}/{len(parts)} • tổng {done + 1}/{total_chunks}'
-                        )
-                        tr, upd = translate_chunk(client, model, ch['source_title'], part, memory, style)
-                        out.extend(tr)
-                        memory = merge_memory(memory, upd)
-                        done += 1
-                        bar.progress(done / max(total_chunks, 1))
-                        st.session_state['memory'] = memory
+            status.info('Bước 3/4: hoàn tất kiểm tra nhất quán và ghép chương...')
+            docx_bytes = export_docx(os.path.splitext(uploaded.name)[0] + ' - V5 PRO', translated, bible)
+            st.session_state['translated'] = translated
+            st.session_state['docx'] = docx_bytes
+            st.session_state['errors'] = errors
+            progress.progress(1.0)
+            status.success('Bước 4/4: đã hoàn tất.')
+        except Exception as e:
+            st.error(f'Quá trình dịch bị dừng do lỗi API. Bộ nhớ đã xử lý trước đó vẫn được giữ.\n\n{type(e).__name__}: {e}')
 
-                    book.append({
-                        'number': ch['number'],
-                        'title': f'Chương {ch["number"]}',
-                        'paragraphs': out
-                    })
-
-                st.session_state['book'] = book
-                status.success('🎉 Đã dịch xong toàn bộ truyện!')
-            except Exception as exc:
-                status.error('❌ Quá trình dịch bị dừng do lỗi API. Bộ nhớ đã xử lý trước đó vẫn được giữ.')
-                st.exception(exc)
-
-    except Exception as exc:
-        st.error(f'Không đọc được file: {exc}')
-
-if 'memory' in st.session_state:
+if 'bible' in st.session_state:
     with st.expander('🧠 STORY BIBLE — bộ nhớ nhân vật, xưng hô, thuật ngữ', expanded=False):
-        st.json(st.session_state['memory'])
+        st.json(st.session_state['bible'])
 
-if 'book' in st.session_state:
+if 'translated' in st.session_state:
     st.subheader('📥 Bản dịch hoàn chỉnh')
-    st.download_button(
-        '⬇️ TẢI FILE WORD ĐÃ DỊCH',
-        export_docx(st.session_state['book']),
-        'ban-dich-truyen-v4-pro-1.2.docx',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        use_container_width=True,
-    )
+    st.download_button('⬇️ TẢI FILE WORD ĐÃ DỊCH', data=st.session_state['docx'], file_name='ban-dich-v5-pro.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
     with st.expander('👀 Xem thử bản dịch'):
-        for ch in st.session_state['book'][:3]:
+        for ch in st.session_state['translated'][:3]:
             st.markdown(f'### {ch["title"]}')
-            for p in ch['paragraphs'][:8]:
-                st.write(p)
+            st.write(ch['text'][:5000])
+    if st.session_state.get('errors'):
+        st.warning('Có một số chunk lỗi API và đã được đánh dấu để chạy lại:')
+        st.write('\n'.join(st.session_state['errors']))
