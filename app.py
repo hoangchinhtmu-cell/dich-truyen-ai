@@ -1,606 +1,195 @@
-import io
-import json
-import re
-import time
+import io, json, re, time
 from pathlib import Path
-
-import requests
 import streamlit as st
 from docx import Document
-from docx.shared import Pt
+from openai import OpenAI
 
-# ============================================================
-# DỊCH TRUYỆN AI - V1
-# DeepSeek API + Word DOCX
-# ============================================================
+st.set_page_config(page_title='Dịch Truyện AI V2', page_icon='📖', layout='wide')
 
-st.set_page_config(
-    page_title="Dịch Truyện AI",
-    page_icon="📖",
-    layout="wide",
-)
+DEFAULT_STYLE = '''Văn phong truyện tự nhiên, mượt, dễ đọc như bản dịch tiểu thuyết Việt được biên tập kỹ. Giữ sắc thái cảm xúc và bối cảnh. Đối thoại tự nhiên, không máy móc. Không tự ý thêm, bớt hoặc giải thích nội dung.'''
+DEFAULT_MODEL = 'deepseek-v4-pro'
 
-SYSTEM_TRANSLATE = """
-Bạn là biên tập viên và dịch giả văn học Trung -> Việt chuyên nghiệp.
+# ---------- đọc file ----------
+def read_docx(data):
+    doc = Document(io.BytesIO(data))
+    return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
 
-Mục tiêu:
-- Dịch tự nhiên như văn truyện tiếng Việt, không dịch máy cứng nhắc.
-- Không tự ý thêm, bớt hoặc giải thích nội dung.
-- Giữ đúng ý, sắc thái, cảm xúc, quan hệ và bối cảnh.
-- Tên nhân vật, địa danh, tổ chức và thuật ngữ phải nhất quán theo BỘ NHỚ TRUYỆN.
-- Tuyệt đối ưu tiên quy tắc xưng hô đã có trong BỘ NHỚ TRUYỆN.
-- Nếu ngữ cảnh mới cho thấy một quy tắc cần thay đổi, không tự ý đổi giữa chừng; đánh dấu nhu cầu cập nhật ở cuối bằng [CẦN CẬP NHẬT BỘ NHỚ].
-- Giữ bố cục đoạn văn: mỗi đoạn tiếng Trung tương ứng một đoạn tiếng Việt.
-- Không dịch tiêu đề chương thành nội dung khác.
-- Không đưa lời bình của người dịch vào bản dịch.
-
-Quy tắc văn phong:
-- Tiếng Việt tự nhiên, mượt, phù hợp văn học.
-- Đối thoại phải giống lời nói của nhân vật.
-- Câu văn có thể đảo trật tự để tự nhiên trong tiếng Việt nhưng không được làm sai nghĩa.
-"""
-
-SYSTEM_MEMORY = """
-Bạn là biên tập viên văn học Trung -> Việt.
-Hãy đọc các đoạn truyện được cung cấp và xây dựng BỘ NHỚ TRUYỆN để dùng cho các chương sau.
-
-Chỉ ghi những gì có căn cứ từ văn bản. Không đoán bừa.
-Ưu tiên:
-1. Nhân vật: tên gốc, tên Việt/Hán-Việt nên dùng, giới tính nếu xác định được, vai trò, đặc điểm.
-2. Quan hệ giữa nhân vật.
-3. Xưng hô: ai gọi ai thế nào; ngôi kể dùng thế nào.
-4. Địa danh.
-5. Tổ chức, môn phái, trường học, công ty, vật phẩm.
-6. Thuật ngữ đặc biệt.
-7. Bối cảnh/thể loại.
-8. Các quy tắc dịch cần giữ nguyên.
-
-Trả về JSON hợp lệ, không markdown, theo cấu trúc:
-{
-  "characters": [],
-  "relationships": [],
-  "address_rules": [],
-  "places": [],
-  "organizations": [],
-  "terms": [],
-  "setting": "",
-  "translation_rules": []
-}
-"""
-
-SYSTEM_MERGE = """
-Bạn là biên tập viên quản lý bộ nhớ truyện.
-Hãy hợp nhất các BỘ NHỚ TRUYỆN thành một bộ nhớ duy nhất.
-
-Nguyên tắc:
-- Không xóa thông tin hữu ích chỉ vì xuất hiện ở phần khác.
-- Nếu cùng một nhân vật có nhiều cách viết, chọn cách nhất quán và phổ biến nhất trong văn bản.
-- Không tự bịa giới tính, quan hệ hoặc xưng hô nếu văn bản chưa đủ căn cứ.
-- Xưng hô phải được ghi theo cặp người nói -> người nghe.
-- Thuật ngữ phải có bản dịch thống nhất.
-- Nếu có mâu thuẫn thật sự, ghi vào "translation_rules" để khi dịch cần kiểm tra ngữ cảnh.
-
-Chỉ trả về JSON hợp lệ.
-"""
-
-WORD_RE = re.compile(r"\S+")
-
-
-def get_secret_key():
-    try:
-        return st.secrets["DEEPSEEK_API_KEY"]
-    except Exception:
-        return ""
-
-
-def call_deepseek(api_key, model, system_prompt, user_prompt, temperature=0.2, retries=3):
-    url = "https://api.deepseek.com/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": temperature,
-    }
-
-    last_error = None
-
-    for attempt in range(retries):
+def read_txt(data):
+    for enc in ('utf-8-sig','utf-8','gb18030','gbk'):
         try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=180,
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
-
-            last_error = f"HTTP {response.status_code}: {response.text[:1000]}"
-
-        except Exception as exc:
-            last_error = str(exc)
-
-        if attempt < retries - 1:
-            time.sleep(2 * (attempt + 1))
-
-    raise RuntimeError(last_error or "Không nhận được phản hồi từ DeepSeek.")
-
-
-def extract_json(text):
-    text = text.strip()
-
-    # Bỏ markdown fence nếu model tự thêm.
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Tìm object JSON đầu tiên.
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start >= 0 and end > start:
-        try:
-            return json.loads(text[start : end + 1])
-        except Exception:
+            return [x.strip() for x in data.decode(enc).splitlines() if x.strip()]
+        except UnicodeDecodeError:
             pass
+    raise ValueError('Không đọc được TXT. Hãy lưu TXT bằng UTF-8 hoặc GB18030.')
 
-    raise ValueError("DeepSeek không trả về JSON hợp lệ.")
+# ---------- nhận diện chương ----------
+CHAPTER_RE = re.compile(r'^\s*(第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节卷篇部]|chương\s+\d+(?:\s*[:：.\-].*)?|chapter\s+\d+)(?:\s*)$', re.I)
 
+def split_chapters(paragraphs):
+    starts = [i for i,p in enumerate(paragraphs) if CHAPTER_RE.match(p)]
+    if not starts:
+        return [{'number':1,'source_title':'Chương 1','paragraphs':paragraphs}]
+    out=[]
+    for n,start in enumerate(starts):
+        end = starts[n+1] if n+1 < len(starts) else len(paragraphs)
+        out.append({'number':n+1,'source_title':paragraphs[start], 'paragraphs':paragraphs[start+1:end]})
+    return out
 
-def word_count(text):
-    return len(WORD_RE.findall(text or ""))
+# ---------- chia thông minh: ưu tiên đoạn, rồi câu ----------
+SENTENCE_RE = re.compile(r'(?<=[。！？!?…；;])\s+|(?<=[。！？!?…；;])(?=[\u4e00-\u9fff])')
 
+def split_long_paragraph(p, limit):
+    if len(p) <= limit:
+        return [p]
+    sentences = [x.strip() for x in SENTENCE_RE.split(p) if x.strip()]
+    if not sentences:
+        return [p[i:i+limit] for i in range(0,len(p),limit)]
+    out=[]; cur=''
+    for s in sentences:
+        if cur and len(cur)+1+len(s) > limit:
+            out.append(cur); cur=''
+        cur = s if not cur else cur+' '+s
+    if cur: out.append(cur)
+    return out
 
-def read_uploaded_file(uploaded_file):
-    """Read either DOCX or TXT and return a list of paragraphs."""
-    suffix = Path(uploaded_file.name).suffix.lower()
-
-    if suffix == ".docx":
-        doc = Document(io.BytesIO(uploaded_file.getvalue()))
-
-        paragraphs = []
-        for p in doc.paragraphs:
-            text = p.text.strip()
-            if text:
-                paragraphs.append(text)
-
-        return paragraphs
-
-    if suffix == ".txt":
-        raw = uploaded_file.getvalue()
-
-        # Try common encodings used by Vietnamese/Chinese text files.
-        text = None
-        for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
-            try:
-                text = raw.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-
-        if text is None:
-            raise ValueError(
-                "Không đọc được file TXT. Hãy lưu file dưới dạng UTF-8 "
-                "hoặc UTF-8 with BOM."
-            )
-
-        # Normalize line endings.
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-        # Blank lines separate paragraphs. If the TXT has no blank lines,
-        # each non-empty line is treated as one paragraph.
-        blocks = re.split(r"\n\s*\n+", text)
-
-        paragraphs = []
-        for block in blocks:
-            block = block.strip()
-            if block:
-                paragraphs.append(block)
-
-        return paragraphs
-
-    raise ValueError("Chỉ hỗ trợ file .docx hoặc .txt.")
-
-
-def detect_chapters(paragraphs):
-    chapter_pattern = re.compile(
-        r"^\s*(?:第\s*[0-9零一二三四五六七八九十百千万]+\s*[章回节卷]|"
-        r"第\s*\d+\s*[章回节卷]|"
-        r"chapter\s+\d+)\b",
-        re.I,
-    )
-
-    chapters = []
-    current = []
-
+def make_chunks(paragraphs, limit=7000):
+    chunks=[]; cur=[]; size=0
     for p in paragraphs:
-        if chapter_pattern.match(p):
-            if current:
-                chapters.append(current)
-            current = [p]
-        else:
-            current.append(p)
-
-    if current:
-        chapters.append(current)
-
-    # Nếu file không có tiêu đề chương rõ ràng, coi toàn bộ file là 1 chương.
-    if len(chapters) <= 1:
-        return [paragraphs]
-
-    return chapters
-
-
-def split_for_api(paragraphs, max_words=6500):
-    chunks = []
-    current = []
-    count = 0
-
-    for p in paragraphs:
-        wc = word_count(p)
-
-        if current and count + wc > max_words:
-            chunks.append(current)
-            current = []
-            count = 0
-
-        current.append(p)
-        count += wc
-
-    if current:
-        chunks.append(current)
-
+        pieces = split_long_paragraph(p, limit)
+        for piece in pieces:
+            if cur and size+len(piece)+1 > limit:
+                chunks.append(cur); cur=[]; size=0
+            cur.append(piece); size += len(piece)+1
+    if cur: chunks.append(cur)
     return chunks
 
-
-def compact_memory(memory):
-    return json.dumps(memory, ensure_ascii=False, indent=2)
-
-
-def analyze_story(api_key, model, paragraphs, progress=None):
-    batches = split_for_api(paragraphs, max_words=6500)
-
-    partials = []
-
-    for i, batch in enumerate(batches, 1):
-        text = "\n\n".join(batch)
-
-        prompt = f"""
-Hãy phân tích phần {i}/{len(batches)} của truyện dưới đây.
-
-=== TRUYỆN ===
-{text}
-=== HẾT ===
-
-Chỉ trả về JSON theo cấu trúc đã yêu cầu.
-"""
-
-        result = call_deepseek(
-            api_key,
-            model,
-            SYSTEM_MEMORY,
-            prompt,
-            temperature=0.1,
-        )
-
+# ---------- API ----------
+def ask_json(client, model, system, user, thinking=False):
+    kwargs = dict(model=model, messages=[{'role':'system','content':system},{'role':'user','content':user}], stream=False, response_format={'type':'json_object'})
+    if thinking:
+        kwargs['reasoning_effort']='high'
+    for attempt in range(3):
         try:
-            partials.append(extract_json(result))
+            r=client.chat.completions.create(**kwargs)
+            text=r.choices[0].message.content
+            try: return json.loads(text)
+            except Exception:
+                m=re.search(r'\{.*\}', text, re.S)
+                if m: return json.loads(m.group())
+                raise ValueError('DeepSeek không trả JSON hợp lệ.')
         except Exception:
-            # Nếu một batch lỗi JSON, bỏ qua batch đó thay vì làm mất toàn bộ.
-            continue
+            if attempt==2: raise
+            time.sleep(2*(attempt+1))
 
-        if progress:
-            progress(i / len(batches))
-
-    if not partials:
-        raise RuntimeError("Không tạo được bộ nhớ truyện từ DeepSeek.")
-
-    if len(partials) == 1:
-        return partials[0]
-
-    merge_prompt = f"""
-Hãy hợp nhất các bộ nhớ sau thành MỘT bộ nhớ truyện duy nhất.
-
-{json.dumps(partials, ensure_ascii=False, indent=2)}
-
-Chỉ trả về JSON.
-"""
-
-    merged = call_deepseek(
-        api_key,
-        model,
-        SYSTEM_MERGE,
-        merge_prompt,
-        temperature=0.0,
-    )
-
-    return extract_json(merged)
-
-
-def chapter_title(chapter, number):
-    first = chapter[0].strip() if chapter else ""
-
-    # Nếu có tiêu đề 第xx章 thì giữ nguyên số chương nhưng chuyển tiêu đề thành Chương X.
-    m = re.search(r"第\s*(\d+)\s*[章回节]", first, re.I)
-
-    if m:
-        return f"Chương {m.group(1)}"
-
-    # Nếu file đã có "Chương 1".
-    m = re.search(r"(?:chương|chapter)\s*(\d+)", first, re.I)
-
-    if m:
-        return f"Chương {m.group(1)}"
-
-    return f"Chương {number}"
-
-
-def translate_chapter(api_key, model, chapter, memory, number, style):
-    title = chapter_title(chapter, number)
-
-    # Bỏ dòng tiêu đề chương gốc nếu nó thực sự là tiêu đề.
-    content = chapter[:]
-    if content:
-        first = content[0].strip()
-        if (
-            re.match(r"^第\s*\d+\s*[章回节]", first, re.I)
-            or re.match(r"^(?:chương|chapter)\s*\d+", first, re.I)
-        ):
-            content = content[1:]
-
-    chunks = split_for_api(content, max_words=5500)
-    translated_parts = []
-
-    memory_text = compact_memory(memory)
-
-    for part in chunks:
-        source = "\n\n".join(part)
-
-        prompt = f"""
-BỘ NHỚ TRUYỆN:
-{memory_text}
-
-PHONG CÁCH:
-{style}
-
-TIÊU ĐỀ:
-{title}
-
-Hãy dịch phần văn bản sau sang tiếng Việt.
-
-=== BẮT ĐẦU ===
-{source}
-=== KẾT THÚC ===
-
-Chỉ trả về bản dịch tiếng Việt.
-Giữ đúng số đoạn: mỗi đoạn nguồn cách nhau bằng một dòng trống thì bản dịch cũng cách nhau bằng một dòng trống.
-Không thêm chú thích.
-"""
-
-        result = call_deepseek(
-            api_key,
-            model,
-            SYSTEM_TRANSLATE,
-            prompt,
-            temperature=0.3,
-        )
-
-        translated_parts.append(result.strip())
-
-    return title, "\n\n".join(translated_parts)
-
-
-def create_docx(translated_chapters):
-    out = Document()
-
-    # Xóa paragraph trắng mặc định.
-    for p in list(out.paragraphs):
-        p._element.getparent().remove(p._element)
-
-    for idx, (title, text) in enumerate(translated_chapters):
-        if idx > 0:
-            out.add_page_break()
-
-        p = out.add_paragraph()
-        run = p.add_run(title)
-        run.bold = True
-        run.font.size = Pt(16)
-
-        for paragraph in text.split("\n\n"):
-            paragraph = paragraph.strip()
-
-            if paragraph:
-                out.add_paragraph(paragraph)
-
-    buffer = io.BytesIO()
-    out.save(buffer)
-    return buffer.getvalue()
-
-
-# ============================================================
-# UI
-# ============================================================
-
-st.title("📖 Dịch Truyện AI")
-st.caption(
-    "Dịch truyện Trung → Việt bằng DeepSeek, hỗ trợ Word (.docx) và TXT (.txt), "
-    "có bộ nhớ nhân vật, xưng hô và thuật ngữ để giữ nhất quán xuyên suốt truyện."
-)
-
-with st.sidebar:
-    st.header("⚙️ Cài đặt")
-
-    secret_key = get_secret_key()
-
-    if secret_key:
-        api_key = secret_key
-        st.success("✅ Đã nhận DEEPSEEK_API_KEY từ Secrets.")
+def build_story_bible(client, model, chapters, style, sample_chars=90000):
+    # Phân tích nhiều mẫu rải đều thay vì chỉ đọc 12 chương đầu.
+    if len(chapters) <= 20:
+        selected=chapters
     else:
-        api_key = st.text_input(
-            "DeepSeek API Key",
-            type="password",
-            help="Tạm thời có thể nhập tại đây để thử. Không lưu API key vào GitHub.",
-        )
+        idxs=list(range(10))+list(range(max(10,len(chapters)//2-5), min(len(chapters),len(chapters)//2+5)))+list(range(max(0,len(chapters)-10),len(chapters)))
+        selected=[chapters[i] for i in sorted(set(idxs))]
+    blocks=[]
+    for ch in selected:
+        blocks.append(f"### {ch['source_title']}\n"+'\n'.join(ch['paragraphs'][:45]))
+    text='\n\n'.join(blocks)[:sample_chars]
+    system='''Bạn là biên tập viên truyện Trung -> Việt. Hãy xây STORY BIBLE để dịch cả tiểu thuyết nhất quán. Không dịch ở bước này. Chỉ ghi thông tin có căn cứ, không bịa. Đặc biệt theo dõi tên nhân vật, tên Việt/Hán-Việt, giới tính, vai trò, quan hệ, tuổi/vai vế, xưng hô giữa từng cặp, địa danh, tổ chức, chức danh, thuật ngữ và quy tắc văn phong.'''
+    user=f'''Phong cách: {style}\n\nTrả JSON đúng cấu trúc:\n{{"characters":[],"pronoun_rules":[],"glossary":[],"places":[],"organizations":[],"world_rules":[],"style_rules":[],"uncertain_items":[]}}\n\nTRÍCH MẪU RẢI ĐỀU TRONG TRUYỆN:\n{text}'''
+    return ask_json(client,model,system,user,thinking=True)
 
-    model = st.text_input(
-        "Model DeepSeek",
-        value="deepseek-chat",
-        help="Có thể thay bằng model DeepSeek mà tài khoản/API của bạn đang hỗ trợ.",
-    )
+def relevant_memory(memory, source):
+    # Lọc các mục có tên/thuật ngữ xuất hiện trong chunk. Nếu không tìm thấy gì, gửi một phần nền.
+    blob=source
+    result={'characters':[],'pronoun_rules':[],'glossary':[],'places':[],'organizations':[],'world_rules':memory.get('world_rules',[])[:20],'style_rules':memory.get('style_rules',[])[:20]}
+    names=[]
+    for c in memory.get('characters',[]):
+        keys=[c.get('name_cn',''),c.get('name_vi','')]
+        if any(k and k in blob for k in keys):
+            result['characters'].append(c); names.extend([k for k in keys if k])
+    for r in memory.get('pronoun_rules',[]):
+        txt=json.dumps(r,ensure_ascii=False)
+        if any(n in txt for n in names): result['pronoun_rules'].append(r)
+    for k in ('glossary','places','organizations'):
+        for x in memory.get(k,[]):
+            txt=json.dumps(x,ensure_ascii=False)
+            if any(v and v in blob for v in [x.get('source',''),x.get('translation',''),x.get('name_cn',''),x.get('name_vi','')]): result[k].append(x)
+    if not result['characters']:
+        result['characters']=memory.get('characters',[])[:30]
+    if not result['pronoun_rules']:
+        result['pronoun_rules']=memory.get('pronoun_rules',[])[:30]
+    return result
 
-    style = st.text_area(
-        "Phong cách dịch",
-        value=(
-            "Văn phong truyện tự nhiên, mượt, dễ đọc. "
-            "Giữ sắc thái cảm xúc và phù hợp thể loại đam mỹ/tiểu thuyết. "
-            "Đối thoại tự nhiên, không máy móc."
-        ),
-        height=130,
-    )
+def translate_chunk(client, model, chapter_title, chunk, memory, style):
+    source='\n'.join(f'[P{i+1}] {p}' for i,p in enumerate(chunk))
+    rel=relevant_memory(memory, source)
+    system='''Bạn là dịch giả tiểu thuyết Trung -> Việt chuyên nghiệp. Dịch tự nhiên, mượt, đúng sắc thái và bối cảnh. Không dịch từng chữ máy móc. Không tự ý thêm/bớt nội dung. Tên nhân vật, giới tính, quan hệ và xưng hô phải tuân theo STORY BIBLE. Giữ đúng thứ tự và số đoạn [P1], [P2]... Trả JSON duy nhất: {"paragraphs":["..."],"memory_updates":{"characters":[],"pronoun_rules":[],"glossary":[],"places":[],"organizations":[],"world_rules":[]}}'''
+    user=f'''CHƯƠNG: {chapter_title}\nPHONG CÁCH:\n{style}\n\nSTORY BIBLE LIÊN QUAN:\n{json.dumps(rel,ensure_ascii=False,indent=2)}\n\nĐOẠN NGUỒN:\n{source}\n\nYÊU CẦU: Đầu vào có {len(chunk)} đoạn; đầu ra paragraphs phải có đúng {len(chunk)} phần tử. Không đưa [P] vào bản dịch.'''
+    d=ask_json(client,model,system,user,thinking=False)
+    if len(d.get('paragraphs',[])) != len(chunk):
+        user += f'\nCẢNH BÁO: hãy sửa số lượng phần tử thành đúng {len(chunk)}.'
+        d=ask_json(client,model,system,user,thinking=False)
+    return d.get('paragraphs',[]), d.get('memory_updates',{})
 
-uploaded = st.file_uploader(
-    "📄 Tải file Word hoặc TXT tiếng Trung",
-    type=["docx", "txt"],
-)
+def merge_memory(mem, upd):
+    for k in ('characters','pronoun_rules','glossary','places','organizations','world_rules','style_rules'): mem.setdefault(k,[])
+    for k in ('characters','pronoun_rules','glossary','places','organizations'):
+        for x in upd.get(k,[]):
+            if x and x not in mem[k]: mem[k].append(x)
+    for k in ('world_rules','style_rules'):
+        for x in upd.get(k,[]):
+            if x and x not in mem[k]: mem[k].append(x)
+    return mem
 
-if uploaded is None:
-    st.info("👆 Hãy tải một file .docx lên để bắt đầu.")
-    st.stop()
+def export_docx(book):
+    doc=Document()
+    for i,ch in enumerate(book):
+        doc.add_heading(ch['title'], level=1)
+        for p in ch['paragraphs']: doc.add_paragraph(p)
+        if i < len(book)-1: doc.add_page_break()
+    b=io.BytesIO(); doc.save(b); return b.getvalue()
 
-try:
-    paragraphs = read_uploaded_file(uploaded)
-except Exception as exc:
-    st.error(f"Không đọc được file Word: {exc}")
-    st.stop()
+# ---------- UI ----------
+st.sidebar.title('⚙️ Cài đặt')
+api_key=st.sidebar.text_input('DeepSeek API Key', type='password')
+model=st.sidebar.text_input('Mô hình DeepSeek', value=DEFAULT_MODEL)
+style=st.sidebar.text_area('Phong cách dịch', value=DEFAULT_STYLE, height=170)
+limit=st.sidebar.slider('Độ dài mỗi lượt dịch (ký tự)', 4000, 10000, 7000, 500)
 
-chapters = detect_chapters(paragraphs)
+st.title('📖 Dịch Truyện AI V2')
+st.caption('Word/TXT → nhận diện chương → STORY BIBLE → chia nhỏ thông minh → lọc bộ nhớ liên quan → dịch → cập nhật bộ nhớ → xuất Word')
 
-st.success(
-    f"Đã đọc **{uploaded.name}** · "
-    f"{len(paragraphs):,} đoạn · "
-    f"phát hiện khoảng **{len(chapters):,} chương/phần**."
-)
+file=st.file_uploader('📄 Tải 1 file truyện dài', type=['docx','txt'])
+if file:
+    raw=file.getvalue()
+    paras=read_docx(raw) if file.name.lower().endswith('.docx') else read_txt(raw)
+    chapters=split_chapters(paras)
+    total_chars=sum(len(p) for p in paras)
+    total_chunks=sum(len(make_chunks(c['paragraphs'],limit)) for c in chapters)
+    st.success(f'Đã đọc {len(paras):,} đoạn • {total_chars:,} ký tự • phát hiện {len(chapters):,} chương • dự kiến {total_chunks:,} lượt dịch.')
+    if not api_key: st.warning('Nhập DeepSeek API Key ở thanh bên trái trước khi bắt đầu.')
+    if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH', type='primary', disabled=not bool(api_key)):
+        client=OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
+        status=st.empty(); bar=st.progress(0)
+        status.info('Bước 1/2: đang tạo STORY BIBLE...')
+        memory=build_story_bible(client,model,chapters,style)
+        st.session_state['memory']=memory
+        status.info('Bước 2/2: đang chia nhỏ và dịch từng phần...')
+        book=[]; done=0
+        for ch in chapters:
+            out=[]
+            for part in make_chunks(ch['paragraphs'],limit):
+                tr,upd=translate_chunk(client,model,ch['source_title'],part,memory,style)
+                out.extend(tr); memory=merge_memory(memory,upd); done+=1
+                bar.progress(done/max(total_chunks,1)); status.info(f'Đang dịch Chương {ch["number"]}/{len(chapters)} • phần {done}/{total_chunks}')
+            book.append({'number':ch['number'],'title':f'Chương {ch["number"]}','paragraphs':out})
+        st.session_state['memory']=memory; st.session_state['book']=book
+        status.success('🎉 Đã dịch xong toàn bộ truyện!')
 
-if not api_key:
-    st.warning(
-        "Bạn chưa cấu hình DeepSeek API key. "
-        "Hãy thêm DEEPSEEK_API_KEY vào Streamlit Secrets."
-    )
-    st.stop()
-
-if st.button("🧠 PHÂN TÍCH TRUYỆN", use_container_width=True):
-    progress = st.progress(0)
-    status = st.empty()
-
-    try:
-        status.info("Đang đọc truyện và xây dựng bộ nhớ nhân vật/xưng hô...")
-        memory = analyze_story(
-            api_key,
-            model,
-            paragraphs,
-            progress=progress.progress,
-        )
-
-        st.session_state["story_memory"] = memory
-        st.session_state["story_name"] = uploaded.name
-
-        progress.progress(1.0)
-        status.success("✅ Đã tạo bộ nhớ truyện.")
-    except Exception as exc:
-        st.error(f"Phân tích thất bại: {exc}")
-
-if "story_memory" in st.session_state:
-    memory = st.session_state["story_memory"]
-
-    with st.expander("🧠 Xem bộ nhớ truyện", expanded=False):
-        st.json(memory)
-
-    st.divider()
-
-    if st.button(
-        "✨ BẮT ĐẦU DỊCH TRUYỆN",
-        type="primary",
-        use_container_width=True,
-    ):
-        translated = []
-        progress = st.progress(0)
-        status = st.empty()
-
-        try:
-            for i, chapter in enumerate(chapters, 1):
-                status.info(
-                    f"Đang dịch Chương {i}/{len(chapters)}..."
-                )
-
-                title, text = translate_chapter(
-                    api_key,
-                    model,
-                    chapter,
-                    memory,
-                    i,
-                    style,
-                )
-
-                translated.append((title, text))
-                progress.progress(i / len(chapters))
-
-            st.session_state["translated_chapters"] = translated
-
-            status.success(
-                f"✅ Đã dịch xong {len(translated):,} chương."
-            )
-
-        except Exception as exc:
-            st.error(f"Dịch thất bại: {exc}")
-
-if "translated_chapters" in st.session_state:
-    translated = st.session_state["translated_chapters"]
-
-    st.subheader("📚 Kết quả")
-
-    st.write(f"Đã hoàn thành: **{len(translated):,} chương**.")
-
-    output = create_docx(translated)
-
-    original = Path(
-        st.session_state.get("story_name", "truyen.docx")
-    ).stem
-
-    filename = f"{original}_dich_tieng_viet.docx"
-
-    st.download_button(
-        "⬇️ TẢI FILE WORD ĐÃ DỊCH",
-        data=output,
-        file_name=filename,
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "wordprocessingml.document"
-        ),
-        use_container_width=True,
-    )
-
-    with st.expander("👀 Xem thử bản dịch"):
-        for i, (title, text) in enumerate(translated[:3], 1):
-            st.markdown(f"### {title}")
-            st.write(text[:5000])
-            if i < min(3, len(translated)):
-                st.divider()
-
-st.divider()
-st.caption(
-    "V1 · DeepSeek API · Bộ nhớ nhân vật/xưng hô/thuật ngữ · Xuất một file Word"
-)
+if 'memory' in st.session_state:
+    with st.expander('🧠 STORY BIBLE — bộ nhớ truyện', expanded=False): st.json(st.session_state['memory'])
+if 'book' in st.session_state:
+    st.subheader('📥 Tải bản dịch')
+    st.download_button('⬇️ TẢI FILE WORD ĐÃ DỊCH', export_docx(st.session_state['book']), 'ban-dich-truyen.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', use_container_width=True)
+    with st.expander('👀 Xem thử 3 chương đầu'):
+        for ch in st.session_state['book'][:3]:
+            st.markdown(f'### {ch["title"]}')
+            for p in ch['paragraphs'][:8]: st.write(p)
