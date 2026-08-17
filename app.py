@@ -6,7 +6,7 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 
-APP_VERSION = "Dịch Truyện AI V5.1 PRO"
+APP_VERSION = "Dịch Truyện AI V5.2 PRO"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
 # -----------------------------
@@ -102,38 +102,38 @@ def extract_content(response) -> str:
 
 def call_model(client: OpenAI, model: str, system: str, user: str,
                max_tokens: int, json_mode: bool = False,
-               thinking: bool = True, retries: int = 3) -> str:
+               thinking: bool = True, retries: int = 4) -> str:
     last_error = None
-    for attempt in range(retries):
-        try:
-            kwargs = dict(
-                model=model,
-                messages=[{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
-                max_tokens=max_tokens,
-                stream=False,
-            )
-            if json_mode:
-                kwargs['response_format'] = {'type': 'json_object'}
-            # V5 fix: the OpenAI Python SDK may reject thinking=... as a direct
-            # keyword. DeepSeek documents it as an API field; extra_body keeps
-            # it compatible with the OpenAI SDK.
-            if thinking:
-                kwargs['reasoning_effort'] = 'high'
-                kwargs['extra_body'] = {'thinking': {'type': 'enabled'}}
-            else:
-                kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
-            response = client.chat.completions.create(**kwargs)
-            content = extract_content(response)
-            if content:
-                return content
-            last_error = RuntimeError('DeepSeek trả về nội dung rỗng.')
-        except Exception as e:
-            last_error = e
-        time.sleep(min(2 ** attempt, 5))
-        # A blank/failed thinking request can be retried once without thinking.
-        if attempt == 1 and thinking:
-            thinking = False
-    raise last_error or RuntimeError('API không trả về nội dung.')
+    modes = [thinking] if not thinking else [True, False]
+    for mode in modes:
+        for attempt in range(retries):
+            try:
+                kwargs = dict(
+                    model=model,
+                    messages=[
+                        {'role': 'system', 'content': system},
+                        {'role': 'user', 'content': user},
+                    ],
+                    max_tokens=max_tokens,
+                    stream=False,
+                )
+                if json_mode:
+                    kwargs['response_format'] = {'type': 'json_object'}
+                    mode = False
+                if mode:
+                    kwargs['reasoning_effort'] = 'high'
+                    kwargs['extra_body'] = {'thinking': {'type': 'enabled'}}
+                else:
+                    kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
+                response = client.chat.completions.create(**kwargs)
+                content = extract_content(response)
+                if content:
+                    return content
+                last_error = RuntimeError('DeepSeek trả về nội dung rỗng.')
+            except Exception as e:
+                last_error = e
+            time.sleep(min(1.5 * (2 ** attempt), 8))
+    raise last_error or RuntimeError('DeepSeek API không trả về nội dung.')
 
 
 def _extract_json_object(raw: str):
@@ -182,20 +182,42 @@ def _extract_json_object(raw: str):
     raise ValueError("Model trả về JSON không hợp lệ.")
 
 
-def call_json(client, model, system, user, max_tokens=7000):
-    # Use normal text mode for JSON-producing calls. This avoids compatibility
-    # problems with response_format=json_object on some DeepSeek V4 endpoints.
-    json_system = system + "\n\nQUAN TRỌNG: Chỉ trả về đúng MỘT JSON object hợp lệ. Không markdown, không giải thích, không đặt JSON trong code fence."
+def call_json(client, model, system, user, max_tokens=7000, retries=3):
+    """Reliable DeepSeek JSON call.
+
+    JSON Output is requested using DeepSeek's official response_format. JSON
+    calls deliberately use non-thinking mode because DeepSeek documents that
+    JSON Output can occasionally return empty content; retry/fallback handles it.
+    """
+    json_system = system + "\n\nQUAN TRỌNG: Chỉ trả về đúng MỘT JSON object hợp lệ theo schema. Không markdown, không code fence, không giải thích bên ngoài JSON. Nếu chưa biết trường nào, dùng chuỗi rỗng hoặc mảng rỗng."
     last_error = None
-    for attempt in range(2):
+
+    # First: official JSON Output, non-thinking.
+    for attempt in range(retries):
         try:
             raw = call_model(client, model, json_system, user, max_tokens,
-                             json_mode=False, thinking=(attempt == 0), retries=2)
-            return _extract_json_object(raw)
+                             json_mode=True, thinking=False, retries=2)
+            obj = _extract_json_object(raw)
+            if isinstance(obj, dict):
+                return obj
+            raise ValueError("JSON trả về không phải object.")
         except Exception as e:
             last_error = e
-            if attempt == 0:
-                time.sleep(1)
+            time.sleep(min(1.5 * (attempt + 1), 5))
+
+    # Second: plain-text JSON fallback, still non-thinking.
+    fallback_system = json_system + "\nNếu JSON Output không hoạt động, vẫn chỉ xuất JSON thuần văn bản."
+    for attempt in range(2):
+        try:
+            raw = call_model(client, model, fallback_system, user, max_tokens,
+                             json_mode=False, thinking=False, retries=2)
+            obj = _extract_json_object(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception as e:
+            last_error = e
+            time.sleep(min(2 * (attempt + 1), 5))
+
     raise last_error or ValueError("Model trả về JSON không hợp lệ.")
 
 # -----------------------------
@@ -223,9 +245,15 @@ Không tự bịa chi tiết không có trong văn bản. Nếu chưa chắc, đ
 Trả về JSON đúng schema được yêu cầu.'''
 
 
-def build_story_bible(client, model, chapters, style, sample_limit=50000):
-    source = '\n\n'.join(f"[{c['title']}]\n{c['text']}" for c in chapters)
-    source = source[:sample_limit]
+def build_story_bible(client, model, chapters, style, sample_limit=60000):
+    pieces = []
+    if len(chapters) == 1:
+        pieces.append(f"[{chapters[0]['title']}]\n{chapters[0]['text'][:sample_limit]}")
+    else:
+        per_chapter = max(700, sample_limit // len(chapters))
+        for c in chapters:
+            pieces.append(f"[{c['title']}]\n{c['text'][:per_chapter]}")
+    source = '\n\n'.join(pieces)[:sample_limit]
     user = f'''Phong cách dịch mong muốn:
 {style}
 
@@ -286,7 +314,7 @@ Không tóm tắt, không thêm nội dung, không đổi giọng kể ngoài ph
 Trả về toàn bộ đoạn đã sửa, không giải thích.'''
 
 
-def translate_chunk(client, model, bible_text, prev_context, source_chunk, style):
+def translate_chunk(client, model, bible_text, prev_context, source_chunk, style, thinking=True):
     user = f'''{bible_text}
 
 PHONG CÁCH DỊCH:
@@ -297,7 +325,7 @@ NGỮ CẢNH LIỀN TRƯỚC (chỉ để hiểu quan hệ, không dịch lại)
 
 ĐOẠN NGUỒN CẦN DỊCH:
 {source_chunk}'''
-    return call_model(client, model, TRANSLATE_SYSTEM, user, max_tokens=9000, json_mode=False, thinking=True)
+    return call_model(client, model, TRANSLATE_SYSTEM, user, max_tokens=9000, json_mode=False, thinking=thinking)
 
 
 def validate_chunk(client, model, bible_text, source, translated):
@@ -314,7 +342,7 @@ BẢN DỊCH:
         return {'ok': True, 'issues': []}
 
 
-def fix_chunk(client, model, bible_text, translated, issues):
+def fix_chunk(client, model, bible_text, translated, issues, thinking=True):
     if not issues:
         return translated
     user = f'''{bible_text}
@@ -324,7 +352,7 @@ LỖI CẦN SỬA:
 
 BẢN DỊCH:
 {translated}'''
-    return call_model(client, model, FIX_SYSTEM, user, max_tokens=9000, thinking=True)
+    return call_model(client, model, FIX_SYSTEM, user, max_tokens=9000, thinking=thinking)
 
 # deterministic guardrails for obvious pronoun drift
 
@@ -363,8 +391,8 @@ def export_docx(title: str, translated_chapters: List[Dict[str, str]], bible: Di
 
 st.set_page_config(page_title=APP_VERSION, page_icon='📖', layout='wide')
 
-st.title('📖 Dịch Truyện AI V5.1 PRO')
-st.caption('Word/TXT → nhận diện chương → STORY BIBLE khóa xưng hô → chia nhỏ thông minh → dịch → kiểm tra → sửa lỗi → xuất Word')
+st.title('📖 Dịch Truyện AI V5.3 PRO')
+st.caption('Word/TXT → nhận diện chương → STORY BIBLE khóa xưng hô → chia nhỏ thông minh → dịch → kiểm tra → sửa lỗi → theo dõi tiến độ → xuất Word')
 
 with st.sidebar:
     st.header('⚙️ Cài đặt')
@@ -373,7 +401,7 @@ with st.sidebar:
     style = st.text_area('Phong cách dịch', value='Văn phong truyện tự nhiên, mượt, dễ đọc như bản dịch tiểu thuyết Việt được biên tập kỹ. Giữ sắc thái cảm xúc và bối cảnh. Đối thoại tự nhiên, không máy móc. Không tự ý thêm, bớt hoặc giải thích nội dung.', height=180)
     chunk_size = st.slider('Độ dài mỗi lượt dịch (ký tự)', 3500, 10000, 7000, 500)
     use_thinking = st.checkbox('DeepSeek V4 Pro Thinking', value=True)
-    st.info('V5.1 Pro có STORY BIBLE khóa xưng hô + kiểm tra/sửa sau mỗi chunk; phần JSON có cơ chế chống lỗi định dạng.')
+    st.info('V5.3 Pro: thêm bảng theo dõi tiến độ theo chương/chunk + STORY BIBLE khóa xưng hô + retry/fallback.')
 
 uploaded = st.file_uploader('📄 Tải 1 file truyện dài', type=['docx', 'txt'])
 
@@ -390,52 +418,94 @@ if uploaded:
         st.warning('Hãy nhập DeepSeek API Key ở thanh bên trái.')
         st.stop()
 
-    if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH V5.1 PRO', type='primary'):
+    if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH V5.3 PRO', type='primary'):
         client = get_client(api_key)
-        progress = st.progress(0)
-        status = st.empty()
+        main_col, monitor_col = st.columns([2.15, 1], gap='large')
+        with monitor_col:
+            st.subheader('📊 TIẾN ĐỘ XỬ LÝ')
+            monitor = st.empty()
+            bar_right = st.empty()
+        with main_col:
+            progress = st.progress(0)
+            status = st.empty()
+
+        chapter_states = {c['title']: '⏳ Chờ xử lý' for c in chapters}
+        started_at = time.time()
+        total_chunks = sum(len(chunk_text(c['text'], chunk_size)) for c in chapters)
+        done = 0
+
+        def render_monitor(stage, current_chapter='', current_chunk=0, chapter_chunk_total=0, note=''):
+            elapsed = int(time.time() - started_at)
+            mm, ss = divmod(elapsed, 60)
+            hh, mm = divmod(mm, 60)
+            elapsed_text = f'{hh:02d}:{mm:02d}:{ss:02d}' if hh else f'{mm:02d}:{ss:02d}'
+            overall = done / max(total_chunks, 1)
+            right_lines = [
+                f'**Giai đoạn:** {stage}',
+                f'**Tổng:** {len(chapters)} chương • {total_chunks} lượt',
+                f'**Đã xong:** {done}/{total_chunks} lượt ({overall*100:.1f}%)',
+                f'**Đang xử lý:** {current_chapter or "—"}',
+                f'**Chunk:** {current_chunk}/{chapter_chunk_total}' if chapter_chunk_total else '**Chunk:** —',
+                f'**Thời gian:** {elapsed_text}',
+            ]
+            if note:
+                right_lines.append(f'**Trạng thái:** {note}')
+            right_lines.append('')
+            right_lines.extend([f'- {k}: {v}' for k, v in chapter_states.items()])
+            monitor.markdown('\n'.join(right_lines))
+            bar_right.progress(min(overall, 1.0))
+
         try:
+            render_monitor('1/4 — STORY BIBLE', note='🧠 Đang phân tích nhân vật và xưng hô')
             status.info('Bước 1/4: đang xây STORY BIBLE khóa nhân vật và xưng hô...')
             bible = build_story_bible(client, model, chapters, style)
             st.session_state['bible'] = bible
 
-            total_chunks = sum(len(chunk_text(c['text'], chunk_size)) for c in chapters)
-            done = 0
             translated = []
             prev = ''
             errors = []
 
             for ci, chapter in enumerate(chapters, start=1):
+                chapter_chunks = chunk_text(chapter['text'], chunk_size)
+                chapter_states[chapter['title']] = '🔄 Đang dịch'
                 status.info(f'Bước 2/4: đang dịch {chapter["title"]} ({ci}/{len(chapters)})...')
+                render_monitor('2/4 — DỊCH', chapter['title'], 0, len(chapter_chunks), '🔄 Bắt đầu chương')
                 out_chunks = []
-                for source_chunk in chunk_text(chapter['text'], chunk_size):
+                for chunk_i, source_chunk in enumerate(chapter_chunks, start=1):
                     bible_text = bible_for_prompt(bible)
+                    render_monitor('2/4 — DỊCH', chapter['title'], chunk_i, len(chapter_chunks), '🤖 Đang gọi DeepSeek')
                     try:
-                        # The UI checkbox controls only effort; the API wrapper also has a safe fallback.
-                        translated_chunk = translate_chunk(client, model, bible_text, prev, source_chunk, style)
+                        translated_chunk = translate_chunk(client, model, bible_text, prev, source_chunk, style, use_thinking)
+                        render_monitor('2/4 — KIỂM TRA', chapter['title'], chunk_i, len(chapter_chunks), '🔍 Đang kiểm tra tên + xưng hô')
                         check = validate_chunk(client, model, bible_text, source_chunk, translated_chunk)
                         issues = check.get('issues', []) if isinstance(check, dict) else []
                         issues += [{'type': 'style', 'original': '', 'translated': '', 'fix': x} for x in pronoun_guard(translated_chunk, bible)]
                         if issues:
-                            translated_chunk = fix_chunk(client, model, bible_text, translated_chunk, issues)
+                            render_monitor('2/4 — SỬA', chapter['title'], chunk_i, len(chapter_chunks), f'🔧 Đang sửa {len(issues)} lỗi')
+                            translated_chunk = fix_chunk(client, model, bible_text, translated_chunk, issues, use_thinking)
                         out_chunks.append(translated_chunk)
                         prev = (prev + '\n\n' + translated_chunk)[-7000:]
                     except Exception as e:
-                        errors.append(f'{chapter["title"]}: {e}')
-                        # Keep source visible rather than silently losing text.
+                        errors.append(f'{chapter["title"]} / chunk {chunk_i}: {type(e).__name__}: {e}')
                         out_chunks.append('[LỖI DỊCH CHUNK — CẦN CHẠY LẠI]\n' + source_chunk)
                     done += 1
                     progress.progress(min(done / max(total_chunks, 1), 1.0))
+                    render_monitor('2/4 — DỊCH', chapter['title'], chunk_i, len(chapter_chunks), '✅ Đã hoàn thành chunk')
+                chapter_states[chapter['title']] = '✅ Hoàn thành' if not any(chapter['title'] in e for e in errors) else '⚠️ Có lỗi chunk'
                 translated.append({'title': chapter['title'], 'text': '\n\n'.join(out_chunks)})
+                render_monitor('2/4 — DỊCH', chapter['title'], len(chapter_chunks), len(chapter_chunks), chapter_states[chapter['title']])
 
             status.info('Bước 3/4: hoàn tất kiểm tra nhất quán và ghép chương...')
-            docx_bytes = export_docx(os.path.splitext(uploaded.name)[0] + ' - V5 PRO', translated, bible)
+            render_monitor('3/4 — GHÉP WORD', note='📄 Đang tạo file Word')
+            docx_bytes = export_docx(os.path.splitext(uploaded.name)[0] + ' - V5.3 PRO', translated, bible)
             st.session_state['translated'] = translated
             st.session_state['docx'] = docx_bytes
             st.session_state['errors'] = errors
             progress.progress(1.0)
+            render_monitor('4/4 — HOÀN TẤT', note='🎉 Đã dịch xong và tạo Word')
             status.success('Bước 4/4: đã hoàn tất.')
         except Exception as e:
+            render_monitor('⛔ DỪNG', note=f'❌ {type(e).__name__}: {e}')
             st.error(f'Quá trình dịch bị dừng do lỗi API. Bộ nhớ đã xử lý trước đó vẫn được giữ.\n\n{type(e).__name__}: {e}')
 
 if 'bible' in st.session_state:
