@@ -6,7 +6,7 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 
-APP_VERSION = "Dịch Truyện AI V5 PRO"
+APP_VERSION = "Dịch Truyện AI V5.1 PRO"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
 # -----------------------------
@@ -136,17 +136,67 @@ def call_model(client: OpenAI, model: str, system: str, user: str,
     raise last_error or RuntimeError('API không trả về nội dung.')
 
 
-def call_json(client, model, system, user, max_tokens=7000):
-    raw = call_model(client, model, system, user, max_tokens, json_mode=True, thinking=True)
-    # tolerate markdown fences despite JSON mode
-    raw = re.sub(r'^```json\s*|^```\s*|\s*```$', '', raw.strip(), flags=re.I)
+def _extract_json_object(raw: str):
+    # DeepSeek V4 Pro can occasionally wrap valid JSON in prose/markdown even
+    # when asked for JSON. Do not depend on response_format=json_object.
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("Model trả về nội dung rỗng khi cần JSON.")
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
     try:
-        return json.loads(raw)
+        return json.loads(text)
     except json.JSONDecodeError:
-        m = re.search(r'\{.*\}', raw, re.S)
-        if m:
-            return json.loads(m.group(0))
-        raise ValueError('Model trả về JSON không hợp lệ.')
+        pass
+
+    # Find the first balanced JSON object, respecting quoted strings.
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i+1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+        start = text.find("{", start + 1)
+    raise ValueError("Model trả về JSON không hợp lệ.")
+
+
+def call_json(client, model, system, user, max_tokens=7000):
+    # Use normal text mode for JSON-producing calls. This avoids compatibility
+    # problems with response_format=json_object on some DeepSeek V4 endpoints.
+    json_system = system + "\n\nQUAN TRỌNG: Chỉ trả về đúng MỘT JSON object hợp lệ. Không markdown, không giải thích, không đặt JSON trong code fence."
+    last_error = None
+    for attempt in range(2):
+        try:
+            raw = call_model(client, model, json_system, user, max_tokens,
+                             json_mode=False, thinking=(attempt == 0), retries=2)
+            return _extract_json_object(raw)
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                time.sleep(1)
+    raise last_error or ValueError("Model trả về JSON không hợp lệ.")
 
 # -----------------------------
 # Story Bible
@@ -313,7 +363,7 @@ def export_docx(title: str, translated_chapters: List[Dict[str, str]], bible: Di
 
 st.set_page_config(page_title=APP_VERSION, page_icon='📖', layout='wide')
 
-st.title('📖 Dịch Truyện AI V5 PRO')
+st.title('📖 Dịch Truyện AI V5.1 PRO')
 st.caption('Word/TXT → nhận diện chương → STORY BIBLE khóa xưng hô → chia nhỏ thông minh → dịch → kiểm tra → sửa lỗi → xuất Word')
 
 with st.sidebar:
@@ -323,7 +373,7 @@ with st.sidebar:
     style = st.text_area('Phong cách dịch', value='Văn phong truyện tự nhiên, mượt, dễ đọc như bản dịch tiểu thuyết Việt được biên tập kỹ. Giữ sắc thái cảm xúc và bối cảnh. Đối thoại tự nhiên, không máy móc. Không tự ý thêm, bớt hoặc giải thích nội dung.', height=180)
     chunk_size = st.slider('Độ dài mỗi lượt dịch (ký tự)', 3500, 10000, 7000, 500)
     use_thinking = st.checkbox('DeepSeek V4 Pro Thinking', value=True)
-    st.info('V5 Pro có kiểm tra xưng hô/tên/thuật ngữ sau mỗi chunk và có bước sửa riêng.')
+    st.info('V5.1 Pro có STORY BIBLE khóa xưng hô + kiểm tra/sửa sau mỗi chunk; phần JSON có cơ chế chống lỗi định dạng.')
 
 uploaded = st.file_uploader('📄 Tải 1 file truyện dài', type=['docx', 'txt'])
 
@@ -340,7 +390,7 @@ if uploaded:
         st.warning('Hãy nhập DeepSeek API Key ở thanh bên trái.')
         st.stop()
 
-    if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH V5 PRO', type='primary'):
+    if st.button('🧠 PHÂN TÍCH + BẮT ĐẦU DỊCH V5.1 PRO', type='primary'):
         client = get_client(api_key)
         progress = st.progress(0)
         status = st.empty()
