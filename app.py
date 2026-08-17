@@ -3,7 +3,7 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 
-st.set_page_config(page_title='Dịch Truyện AI V4 Pro 1.1', page_icon='📖', layout='wide')
+st.set_page_config(page_title='Dịch Truyện AI V4 Pro 1.2', page_icon='📖', layout='wide')
 
 DEFAULT_MODEL = 'deepseek-v4-pro'
 DEFAULT_STYLE = '''Văn phong tiểu thuyết Việt tự nhiên, mượt, dễ đọc như bản dịch được biên tập kỹ.
@@ -142,7 +142,7 @@ def call_json(client, model, system, user, max_tokens=7000, retries=3):
                 stream=False,
                 response_format={'type': 'json_object'},
                 max_tokens=max_tokens,
-                thinking={'type': 'disabled'},
+                extra_body={'thinking': {'type': 'disabled'}},
             )
             choice = response.choices[0]
             content = choice.message.content
@@ -389,7 +389,7 @@ style = st.sidebar.text_area('Phong cách dịch', value=DEFAULT_STYLE, height=1
 limit = st.sidebar.slider('Độ dài mỗi lượt dịch (ký tự)', 3000, 7000, 4500, 500)
 retries = st.sidebar.slider('Số lần thử lại khi API lỗi', 1, 4, 3)
 
-st.title('📖 Dịch Truyện AI V4 Pro 1.1')
+st.title('📖 Dịch Truyện AI V4 Pro 1.2')
 st.caption('Word/TXT → nhận diện chương → STORY BIBLE → chia nhỏ → lọc bộ nhớ → dịch tuần tự → cập nhật bộ nhớ → xuất 1 file Word')
 
 file = st.file_uploader('📄 Tải 1 file truyện dài', type=['docx', 'txt'])
@@ -463,7 +463,7 @@ if 'book' in st.session_state:
     st.download_button(
         '⬇️ TẢI FILE WORD ĐÃ DỊCH',
         export_docx(st.session_state['book']),
-        'ban-dich-truyen-v4-pro-1.1.docx',
+        'ban-dich-truyen-v4-pro-1.2.docx',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         use_container_width=True,
     )
