@@ -3,7 +3,7 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 
-st.set_page_config(page_title='Dịch Truyện AI V4 Pro', page_icon='📖', layout='wide')
+st.set_page_config(page_title='Dịch Truyện AI V4 Pro 1.1', page_icon='📖', layout='wide')
 
 DEFAULT_MODEL = 'deepseek-v4-pro'
 DEFAULT_STYLE = '''Văn phong tiểu thuyết Việt tự nhiên, mượt, dễ đọc như bản dịch được biên tập kỹ.
@@ -124,6 +124,12 @@ def parse_json(text):
 
 
 def call_json(client, model, system, user, max_tokens=7000, retries=3):
+    """Call DeepSeek for structured JSON.
+
+    V4-Pro can spend the whole completion budget on hidden reasoning, which may
+    leave message.content empty. For these structured extraction/translation
+    calls we explicitly disable thinking so the JSON is returned reliably.
+    """
     last_error = None
     for attempt in range(retries):
         try:
@@ -136,8 +142,17 @@ def call_json(client, model, system, user, max_tokens=7000, retries=3):
                 stream=False,
                 response_format={'type': 'json_object'},
                 max_tokens=max_tokens,
+                thinking={'type': 'disabled'},
             )
-            return parse_json(response.choices[0].message.content)
+            choice = response.choices[0]
+            content = choice.message.content
+            if content and content.strip():
+                return parse_json(content)
+
+            finish = getattr(choice, 'finish_reason', None)
+            raise ValueError(
+                f'DeepSeek trả về nội dung rỗng (finish_reason={finish}).'
+            )
         except Exception as exc:
             last_error = exc
             if attempt < retries - 1:
@@ -199,7 +214,7 @@ Không tự bịa thông tin không có trong mẫu.
 
 MẪU RẢI ĐỀU TRONG TRUYỆN:
 {sample}'''
-    return call_json(client, model, system, user, max_tokens=6500)
+    return call_json(client, model, system, user, max_tokens=9000)
 
 
 # =========================
@@ -293,14 +308,14 @@ Hãy trả đúng JSON:
 Đầu vào có {len(chunk)} đoạn. "paragraphs" bắt buộc có đúng {len(chunk)} phần tử.
 Không được đưa ký hiệu [P1], [P2]... vào bản dịch.'''
 
-    data = call_json(client, model, system, user, max_tokens=max(6500, len(chunk) * 900))
+    data = call_json(client, model, system, user, max_tokens=max(8000, len(chunk) * 1000))
     paragraphs = data.get('paragraphs', [])
 
     if len(paragraphs) != len(chunk):
         repair_user = user + f'''
 
 CẢNH BÁO: Bạn vừa trả sai số lượng đoạn. Hãy trả lại JSON với đúng {len(chunk)} phần tử trong "paragraphs".'''
-        data = call_json(client, model, system, repair_user, max_tokens=max(6500, len(chunk) * 900))
+        data = call_json(client, model, system, repair_user, max_tokens=max(8000, len(chunk) * 1000))
         paragraphs = data.get('paragraphs', [])
 
     if len(paragraphs) != len(chunk):
@@ -374,7 +389,7 @@ style = st.sidebar.text_area('Phong cách dịch', value=DEFAULT_STYLE, height=1
 limit = st.sidebar.slider('Độ dài mỗi lượt dịch (ký tự)', 3000, 7000, 4500, 500)
 retries = st.sidebar.slider('Số lần thử lại khi API lỗi', 1, 4, 3)
 
-st.title('📖 Dịch Truyện AI V4 Pro')
+st.title('📖 Dịch Truyện AI V4 Pro 1.1')
 st.caption('Word/TXT → nhận diện chương → STORY BIBLE → chia nhỏ → lọc bộ nhớ → dịch tuần tự → cập nhật bộ nhớ → xuất 1 file Word')
 
 file = st.file_uploader('📄 Tải 1 file truyện dài', type=['docx', 'txt'])
@@ -448,7 +463,7 @@ if 'book' in st.session_state:
     st.download_button(
         '⬇️ TẢI FILE WORD ĐÃ DỊCH',
         export_docx(st.session_state['book']),
-        'ban-dich-truyen-v4-pro.docx',
+        'ban-dich-truyen-v4-pro-1.1.docx',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         use_container_width=True,
     )
